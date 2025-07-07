@@ -1,0 +1,4 @@
+2025-07-07T09:28:07.775Z
+TypeError: Cannot read properties of undefined (reading 'rawHtml')
+    at scrapeVit (C:\Users\mahaj\Downloads\ju-shodh-sahayak-master\ju-shodh-sahayak-master\ju_shodh_sahayak-main\scraper2.js:29:30)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
