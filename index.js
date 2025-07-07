@@ -7,9 +7,34 @@ const { scrapeProposals } = require('./scraper');
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Clean up DATABASE_URL if provided
 if (process.env.DATABASE_URL) {
   process.env.DATABASE_URL = process.env.DATABASE_URL.replace(/(\?|&)sslmode=require/, '');
 }
+
+// Configure Postgres connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/proposals',
+  ssl: false
+});
+
+// ✅ Ensure table exists before handling requests
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS proposals (
+        title TEXT,
+        agency TEXT,
+        from_date TEXT,
+        deadline TEXT,
+        link TEXT
+      );
+    `);
+    console.log('✅ Table "proposals" verified/created.');
+  } catch (err) {
+    console.error('❌ Failed to create/verify proposals table:', err);
+  }
+})();
 
 app.use(cors({ origin: '*' }));
 app.use(rateLimit({
@@ -20,11 +45,7 @@ app.use(rateLimit({
   message: 'Too many requests, please try again later.'
 }));
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/proposals',
-  ssl: false
-});
-
+// Middleware to test DB connection on requests
 app.use(async (req, res, next) => {
   try {
     const client = await pool.connect();
@@ -36,9 +57,7 @@ app.use(async (req, res, next) => {
   }
 });
 
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'UP', timestamp: new Date() });
-});
+app.get('/health', (req, res) => res.status(200).json({ status: 'UP', timestamp: new Date() }));
 
 app.get('/api/proposals', async (req, res) => {
   try {
@@ -63,7 +82,6 @@ app.get('/api/proposals/agency/:agency', async (req, res) => {
   }
 });
 
-// ✅ Open scrape endpoint — no auth required
 app.post('/api/scrape', (req, res) => {
   res.status(202).json({ success: true, message: 'Scrape initiated, this may take a minute...' });
   scrapeProposals()
@@ -73,20 +91,13 @@ app.post('/api/scrape', (req, res) => {
 
 app.get('/', (req, res) => {
   res.send(`
-    <!DOCTYPE html>
-    <html>
-      <head><title>Research Proposals API</title></head>
-      <body>
-        <h1>Research Proposals API</h1>
-        <p>Endpoints:</p>
-        <ul>
-          <li><code>GET /api/proposals</code></li>
-          <li><code>GET /api/proposals/agency/:agency</code></li>
-          <li><code>POST /api/scrape</code> (public)</li>
-          <li><code>GET /health</code></li>
-        </ul>
-      </body>
-    </html>
+    <!DOCTYPE html><html><head><title>Research Proposals API</title></head><body>
+    <h1>Research Proposals API</h1><ul>
+      <li>GET /api/proposals</li>
+      <li>GET /api/proposals/agency/:agency</li>
+      <li>POST /api/scrape</li>
+      <li>GET /health</li>
+    </ul></body></html>
   `);
 });
 
