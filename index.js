@@ -1,3 +1,4 @@
+// index.js
 const cors = require('cors');
 const express = require('express');
 const { Pool } = require('pg');
@@ -7,18 +8,16 @@ const { scrapeProposals } = require('./scraper');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Clean up DATABASE_URL if provided
-if (process.env.DATABASE_URL) {
-  process.env.DATABASE_URL = process.env.DATABASE_URL.replace(/(\?|&)sslmode=require/, '');
-}
+// Debug raw DATABASE_URL to verify env var
+console.log('▶️ raw DATABASE_URL =', JSON.stringify(process.env.DATABASE_URL));
 
-// Configure Postgres connection
+// Configure Postgres connection with SSL
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:password@localhost:5432/proposals',
-  ssl: false
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-// ✅ Ensure table exists before handling requests
+// Ensure table exists before handling requests
 (async () => {
   try {
     await pool.query(`
@@ -27,7 +26,8 @@ const pool = new Pool({
         agency TEXT,
         from_date TEXT,
         deadline TEXT,
-        link TEXT
+        link TEXT,
+        extracted_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
     console.log('✅ Table "proposals" verified/created.');
