@@ -1,11 +1,16 @@
 const FirecrawlApp = require('@mendable/firecrawl-js').default;
 const { parse, isValid } = require('date-fns');
+const { Pool } = require('pg');
 
 const app = new FirecrawlApp({
   apiKey: "fc-22a6d53819e34fcd9fe2ff7ffa58be05"
 });
 
-// ✅ Define this FIRST
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
 const researchUrls = [
   'https://dst.gov.in/call-for-proposals',
   'https://www.dbtindia.gov.in/latest-announcement',
@@ -24,7 +29,6 @@ const researchUrls = [
 ];
 
 const getAgency = (sourceUrl) => {
-  // mapping unchanged...
   if (sourceUrl.includes('dst.gov.in')) return 'DST';
   if (sourceUrl.includes('dbtindia.gov.in')) return 'DBT';
   if (sourceUrl.includes('birac.nic.in')) return 'BIRAC';
@@ -42,11 +46,10 @@ const getAgency = (sourceUrl) => {
 };
 
 const parseDate = (s) => {
-  // unchanged...
   if (!s || typeof s !== 'string') return null;
   const t = s.trim().replace(/\s+/g, ' ');
   if (t.match(/rolling|ongoing|continuous|open|throughout/i)) return 'Rolling Deadline';
-  const formats = ['dd/MM/yyyy','dd-MM-yyyy','MM/dd/yyyy','yyyy-MM-dd','dd MMM yyyy','dd MMMM yyyy','MMM dd, yyyy','MMMM dd, yyyy','dd/MM/yy','dd-MM-yy'];
+  const formats = ['dd/MM/yyyy', 'dd-MM-yyyy', 'MM/dd/yyyy', 'yyyy-MM-dd', 'dd MMM yyyy', 'dd MMMM yyyy', 'MMM dd, yyyy', 'MMMM dd, yyyy', 'dd/MM/yy', 'dd-MM-yy'];
   for (const f of formats) {
     try {
       const d = parse(t, f, new Date());
@@ -105,7 +108,6 @@ const extractProposalsFromMarkdown = (md, srcUrl) => {
         console.log(`  ✅ found ${found.length} direct link(s)`);
         all.push(...found);
         await new Promise(r => setTimeout(r, 500));
-
       } catch (innerErr) {
         console.warn(`  ❌ error scraping ${url}: ${innerErr.message}`);
       }
@@ -123,9 +125,31 @@ const extractProposalsFromMarkdown = (md, srcUrl) => {
       return da - db;
     });
 
-    console.log('\nFinal Proposals (direct links only):\n', JSON.stringify(unique, null, 2));
-  
+    console.log(`\n💾 Inserting ${unique.length} unique proposals to DB...`);
+    for (const proposal of unique) {
+      try {
+        await pool.query(
+          `INSERT INTO proposals (title, agency, from_date, deadline, link)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT DO NOTHING`,
+          [
+            proposal.title,
+            proposal.agency,
+            proposal.startDate || 'Not specified',
+            proposal.endDate || 'Not specified',
+            proposal.link
+          ]
+        );
+      } catch (e) {
+        console.error('❌ DB insert failed:', proposal.title, e.message);
+      }
+    }
+
+    console.log(`✅ Inserted ${unique.length} proposals into database.`);
+
   } catch (fatalErr) {
     console.error('Fatal error:', fatalErr);
+  } finally {
+    await pool.end();
   }
 })();
