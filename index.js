@@ -7,56 +7,58 @@ const { scrapeProposals } = require('./scraper');
 const app = express();
 const port = process.env.PORT || 10000;
 
-// Load environment variables
 require('dotenv').config();
 
 console.log('▶️ Raw DATABASE_URL =', process.env.DATABASE_URL ? 'Set' : 'Not set');
 
-// ✅ RENDER-OPTIMIZED: Database configuration specifically for Render PostgreSQL
+// ✅ RENDER-OPTIMIZED: Pool configuration based on community best practices
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://proposals_velw_user:ujHJKCC0VQPxB3FjEo8cxmNqUbpoAbts@dpg-d2acjc8gjchc73egskcg-a.singapore-postgres.render.com/proposals_velw',
-  ssl: {
-    rejectUnauthorized: false
-  },
-  // ✅ CRITICAL: Render-specific pool settings
-  max: 5,                         // Small pool for Render free tier
-  min: 0,                         // ESSENTIAL: Allow pool to close all connections
-  idleTimeoutMillis: 10000,       // Close idle connections after 10 seconds
-  connectionTimeoutMillis: 10000, // Timeout connection attempts after 10 seconds
-  acquireTimeoutMillis: 10000,    // Timeout waiting for connection
-  createRetryIntervalMillis: 500, // Retry failed connections every 500ms
-  createTimeoutMillis: 10000,     // Timeout creating new connections
-  allowExitOnIdle: true,          // Allow process to exit when pool is empty
+  ssl: { rejectUnauthorized: false },
   
-  // ✅ TCP KEEPALIVE: Prevent connection drops
-  keepAlive: true,                // Enable TCP keepalive
-  keepAliveInitialDelayMillis: 30000  // Start keepalive after 30 seconds
+  // ✅ CRITICAL: Render-specific settings that prevent connection drops
+  max: 3,                           // Very small pool for Render free tier
+  min: 0,                          // ESSENTIAL: Allow pool to close all connections[2]
+  idleTimeoutMillis: 5000,         // Aggressively close idle connections (5 seconds)
+  connectionTimeoutMillis: 8000,   // Quick timeout for new connections
+  acquireTimeoutMillis: 8000,      // Quick timeout waiting for connection
+  createRetryIntervalMillis: 200,  // Fast retry for failed connections
+  createTimeoutMillis: 8000,       // Timeout creating connections
+  allowExitOnIdle: true,           // Allow process to exit when pool empty
+  
+  // ✅ TCP KEEPALIVE: Prevents connection drops[8]
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000  // Start keepalive after 10 seconds
 });
 
-// ✅ CRITICAL: Handle pool errors to prevent app crashes
+// ✅ CRITICAL: Error handling to prevent app crashes
 pool.on('error', (err, client) => {
-  console.error('🚨 Unexpected error on idle client:', err.message);
-  // Don't exit process - just log and continue
+  console.error('🚨 Pool error (non-fatal):', err.message);
+  // Don't exit - this is expected behavior on Render
 });
 
-pool.on('connect', (client) => {
-  console.log('✅ New client connected to database');
-});
+pool.on('connect', () => console.log('✅ New DB client connected'));
+pool.on('remove', () => console.log('🔄 DB client removed from pool'));
 
-pool.on('remove', (client) => {
-  console.log('🔄 Client removed from pool');
-});
-
-// ✅ RESILIENT: Database setup with comprehensive retry logic
+// ✅ ROBUST: Database setup with intelligent retry
 const setupDatabase = async () => {
-  let retryCount = 0;
-  const maxRetries = 5;
+  const maxRetries = 8;
+  let attempt = 0;
   
-  while (retryCount < maxRetries) {
+  while (attempt < maxRetries) {
+    attempt++;
     let client = null;
+    
     try {
-      console.log(`🔄 Database setup attempt ${retryCount + 1}/${maxRetries}...`);
-      client = await pool.connect();
+      console.log(`🔄 Database setup attempt ${attempt}/${maxRetries}...`);
+      
+      // Use shorter timeout for each attempt
+      client = await Promise.race([
+        pool.connect(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Connection timeout')), 5000)
+        )
+      ]);
       
       await client.query(`
         CREATE TABLE IF NOT EXISTS proposals (
@@ -72,25 +74,27 @@ const setupDatabase = async () => {
       `);
       
       const result = await client.query('SELECT COUNT(*) FROM proposals');
-      console.log(`✅ Database connected! Current proposals: ${result.rows[0].count}`);
+      console.log(`✅ Database connected! Proposals count: ${result.rows[0].count}`);
       
       client.release();
       return true;
       
     } catch (err) {
-      retryCount++;
-      if (client) client.release();
-      
-      console.error(`❌ Database setup attempt ${retryCount}/${maxRetries} failed:`, err.message);
-      
-      if (retryCount >= maxRetries) {
-        console.error('💥 Database setup failed after all retries. Service will continue with limited functionality.');
-        return false;
-      } else {
-        const delay = Math.min(1000 * Math.pow(2, retryCount), 10000); // Exponential backoff
-        console.log(`🔄 Retrying in ${delay}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+      if (client) {
+        try { client.release(); } catch (releaseErr) { /* ignore */ }
       }
+      
+      console.error(`❌ Setup attempt ${attempt}/${maxRetries} failed:`, err.message);
+      
+      if (attempt >= maxRetries) {
+        console.error('💥 Database setup failed completely. Starting in degraded mode.');
+        return false;
+      }
+      
+      // Exponential backoff with jitter
+      const delay = Math.min(1000 * Math.pow(1.5, attempt) + Math.random() * 1000, 10000);
+      console.log(`🔄 Retrying in ${Math.round(delay)}ms...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
   return false;
@@ -103,113 +107,126 @@ setupDatabase();
 app.use(cors({ origin: '*' }));
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 200,  // Increased limit
   standardHeaders: true,
   legacyHeaders: false,
-  message: 'Too many requests, please try again later.'
+  message: { error: 'Too many requests, please try again later.' }
 }));
 
-// ✅ IMPROVED: Resilient database middleware with circuit breaker pattern
+// ✅ IMPROVED: Resilient connection middleware with circuit breaker
 let circuitBreakerOpen = false;
+let consecutiveFailures = 0;
 let lastFailureTime = 0;
-const CIRCUIT_BREAKER_TIMEOUT = 60000; // 1 minute
+const CIRCUIT_BREAKER_TIMEOUT = 30000; // 30 seconds
+const FAILURE_THRESHOLD = 3;
+
+const testDatabaseConnection = async () => {
+  let client = null;
+  try {
+    client = await Promise.race([
+      pool.connect(),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Connection timeout')), 3000)
+      )
+    ]);
+    
+    await client.query('SELECT 1');
+    client.release();
+    
+    // Reset circuit breaker on success
+    consecutiveFailures = 0;
+    circuitBreakerOpen = false;
+    return true;
+    
+  } catch (err) {
+    if (client) {
+      try { client.release(); } catch (releaseErr) { /* ignore */ }
+    }
+    
+    consecutiveFailures++;
+    lastFailureTime = Date.now();
+    
+    if (consecutiveFailures >= FAILURE_THRESHOLD) {
+      circuitBreakerOpen = true;
+      console.log('🚨 Circuit breaker OPENED due to consecutive failures');
+    }
+    
+    throw err;
+  }
+};
 
 app.use(async (req, res, next) => {
-  // Circuit breaker logic
+  // Check circuit breaker
   if (circuitBreakerOpen) {
     if (Date.now() - lastFailureTime > CIRCUIT_BREAKER_TIMEOUT) {
-      circuitBreakerOpen = false;
-      console.log('🔄 Circuit breaker reset - attempting database connection');
-    } else {
-      return res.status(503).json({ 
-        error: 'Database temporarily unavailable', 
+      console.log('🔄 Circuit breaker reset attempt...');
+      try {
+        await testDatabaseConnection();
+        console.log('✅ Circuit breaker CLOSED - database recovered');
+      } catch (err) {
+        console.log('❌ Circuit breaker remains OPEN - database still failing');
+      }
+    }
+    
+    if (circuitBreakerOpen) {
+      return res.status(503).json({
+        error: 'Database temporarily unavailable',
         details: 'Service recovering from database issues. Please try again later.',
         timestamp: new Date().toISOString(),
-        service: 'Research Proposals API'
+        service: 'Research Proposals API',
+        retryAfter: Math.round((CIRCUIT_BREAKER_TIMEOUT - (Date.now() - lastFailureTime)) / 1000)
       });
     }
   }
   
-  let client = null;
+  // Quick connection test
   try {
-    // Quick connection test
-    client = await pool.connect();
-    client.release();
-    circuitBreakerOpen = false; // Reset on success
+    await testDatabaseConnection();
     next();
   } catch (err) {
-    if (client) client.release();
-    
     console.error('Database connection error:', err.message);
-    circuitBreakerOpen = true;
-    lastFailureTime = Date.now();
-    
-    res.status(503).json({ 
-      error: 'Database temporarily unavailable', 
-      details: 'Please try again in a few moments',
+    res.status(503).json({
+      error: 'Database temporarily unavailable',
+      details: 'Connection issues detected. Please try again in a moment.',
       timestamp: new Date().toISOString(),
       service: 'Research Proposals API'
     });
   }
 });
 
-// ✅ ENHANCED: Health check with detailed database status
-app.get('/health', async (req, res) => {
-  let dbStatus = 'Unknown';
-  let dbDetails = {};
+// ✅ BULLETPROOF: Query wrapper with automatic retry and proper cleanup
+const executeQuery = async (query, params = [], maxRetries = 3) => {
+  let lastError;
   
-  try {
-    const client = await pool.connect();
-    const start = Date.now();
-    await client.query('SELECT 1');
-    const responseTime = Date.now() - start;
-    client.release();
-    
-    dbStatus = 'Connected';
-    dbDetails = {
-      responseTime: `${responseTime}ms`,
-      poolSize: pool.totalCount,
-      idleCount: pool.idleCount,
-      waitingCount: pool.waitingCount
-    };
-  } catch (err) {
-    dbStatus = 'Disconnected';
-    dbDetails = { error: err.message };
-  }
-  
-  res.status(dbStatus === 'Connected' ? 200 : 503).json({ 
-    status: dbStatus === 'Connected' ? 'UP' : 'DOWN',
-    timestamp: new Date(),
-    database: dbStatus,
-    databaseDetails: dbDetails,
-    environment: process.env.NODE_ENV || 'production',
-    circuitBreaker: circuitBreakerOpen ? 'OPEN' : 'CLOSED'
-  });
-});
-
-// ✅ BULLETPROOF: Database query wrapper with automatic retry
-const executeQuery = async (query, params = [], retries = 2) => {
-  let lastError = null;
-  
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     let client = null;
     try {
-      client = await pool.connect();
+      client = await Promise.race([
+        pool.connect(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Connection timeout')), 5000)
+        )
+      ]);
+      
       const result = await client.query(query, params);
       client.release();
       return result;
+      
     } catch (err) {
-      if (client) client.release();
       lastError = err;
+      if (client) {
+        try { client.release(); } catch (releaseErr) { /* ignore */ }
+      }
       
       // Don't retry on syntax errors
-      if (err.code && (err.code === '42P01' || err.code === '42703')) {
+      if (err.code && ['42P01', '42703', '23505'].includes(err.code)) {
         throw err;
       }
       
-      if (attempt < retries) {
-        console.log(`🔄 Query retry ${attempt + 1}/${retries} after error:`, err.message);
-        await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+      if (attempt < maxRetries) {
+        const delay = 500 * attempt;
+        console.log(`🔄 Query retry ${attempt}/${maxRetries} in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
   }
@@ -217,36 +234,74 @@ const executeQuery = async (query, params = [], retries = 2) => {
   throw lastError;
 };
 
-// ✅ BULLETPROOF: API endpoints using the resilient query wrapper
+// ✅ ENHANCED: Health check with detailed diagnostics
+app.get('/health', async (req, res) => {
+  const health = {
+    status: 'UP',
+    timestamp: new Date().toISOString(),
+    service: 'Research Proposals API',
+    database: 'Unknown',
+    pool: {
+      total: pool.totalCount,
+      idle: pool.idleCount,
+      waiting: pool.waitingCount
+    },
+    circuitBreaker: circuitBreakerOpen ? 'OPEN' : 'CLOSED',
+    consecutiveFailures
+  };
+  
+  try {
+    const start = Date.now();
+    const client = await pool.connect();
+    await client.query('SELECT 1');
+    const responseTime = Date.now() - start;
+    client.release();
+    
+    health.database = 'Connected';
+    health.responseTime = `${responseTime}ms`;
+    res.status(200).json(health);
+    
+  } catch (err) {
+    health.status = 'DEGRADED';
+    health.database = 'Disconnected';
+    health.error = err.message;
+    res.status(503).json(health);
+  }
+});
+
+// ✅ BULLETPROOF: API endpoints using resilient query wrapper
 app.get('/api/proposals', async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = Math.min(parseInt(req.query.limit) || 50, 100); // Max 100 per page
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const offset = (page - 1) * limit;
     
-    const countResult = await executeQuery('SELECT COUNT(*) FROM proposals');
+    const [countResult, dataResult] = await Promise.all([
+      executeQuery('SELECT COUNT(*) FROM proposals'),
+      executeQuery(
+        'SELECT * FROM proposals ORDER BY created_at DESC, deadline DESC LIMIT $1 OFFSET $2',
+        [limit, offset]
+      )
+    ]);
+    
     const totalCount = parseInt(countResult.rows[0].count);
     
-    const result = await executeQuery(
-      'SELECT * FROM proposals ORDER BY created_at DESC, deadline DESC LIMIT $1 OFFSET $2',
-      [limit, offset]
-    );
-    
-    res.json({ 
-      success: true, 
-      count: result.rows.length,
+    res.json({
+      success: true,
+      count: dataResult.rows.length,
       total: totalCount,
       page,
       totalPages: Math.ceil(totalCount / limit),
-      data: result.rows,
+      data: dataResult.rows,
       timestamp: new Date().toISOString()
     });
+    
   } catch (err) {
     console.error('Failed to retrieve proposals:', err);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to retrieve proposals', 
-      details: err.message,
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve proposals',
+      details: process.env.NODE_ENV === 'development' ? err.message : 'Database error',
       timestamp: new Date().toISOString()
     });
   }
@@ -256,23 +311,24 @@ app.get('/api/proposals/agency/:agency', async (req, res) => {
   try {
     const { agency } = req.params;
     const result = await executeQuery(
-      'SELECT * FROM proposals WHERE agency ILIKE $1 ORDER BY created_at DESC, deadline DESC',
+      'SELECT * FROM proposals WHERE agency ILIKE $1 ORDER BY created_at DESC LIMIT 200',
       [`%${agency}%`]
     );
     
-    res.json({ 
-      success: true, 
-      count: result.rows.length, 
-      agency: agency,
+    res.json({
+      success: true,
+      count: result.rows.length,
+      agency,
       data: result.rows,
       timestamp: new Date().toISOString()
     });
+    
   } catch (err) {
-    console.error(`Failed to retrieve proposals for agency ${req.params.agency}:`, err);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to retrieve proposals by agency', 
-      details: err.message,
+    console.error(`Failed to retrieve agency proposals:`, err);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve agency proposals',
+      details: process.env.NODE_ENV === 'development' ? err.message : 'Database error',
       timestamp: new Date().toISOString()
     });
   }
@@ -284,18 +340,19 @@ app.get('/api/agencies', async (req, res) => {
       'SELECT agency, COUNT(*) as proposal_count FROM proposals WHERE agency IS NOT NULL GROUP BY agency ORDER BY proposal_count DESC'
     );
     
-    res.json({ 
-      success: true, 
-      count: result.rows.length, 
+    res.json({
+      success: true,
+      count: result.rows.length,
       data: result.rows,
       timestamp: new Date().toISOString()
     });
+    
   } catch (err) {
     console.error('Failed to retrieve agencies:', err);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to retrieve agencies', 
-      details: err.message,
+    res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve agencies',
+      details: process.env.NODE_ENV === 'development' ? err.message : 'Database error',
       timestamp: new Date().toISOString()
     });
   }
@@ -304,80 +361,69 @@ app.get('/api/agencies', async (req, res) => {
 app.get('/api/proposals/search', async (req, res) => {
   try {
     const { q } = req.query;
-    if (!q) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Search query parameter "q" is required' 
+    if (!q || q.trim().length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'Search query must be at least 2 characters'
       });
     }
     
     const result = await executeQuery(
       'SELECT * FROM proposals WHERE title ILIKE $1 OR agency ILIKE $1 ORDER BY created_at DESC LIMIT 100',
-      [`%${q}%`]
+      [`%${q.trim()}%`]
     );
     
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       count: result.rows.length,
-      query: q,
+      query: q.trim(),
       data: result.rows,
       timestamp: new Date().toISOString()
     });
+    
   } catch (err) {
     console.error('Failed to search proposals:', err);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to search proposals', 
-      details: err.message,
+    res.status(500).json({
+      success: false,
+      error: 'Failed to search proposals',
+      details: process.env.NODE_ENV === 'development' ? err.message : 'Database error',
       timestamp: new Date().toISOString()
     });
   }
 });
 
 app.post('/api/scrape', async (req, res) => {
-  try {
-    res.status(202).json({ 
-      success: true, 
-      message: 'Scrape initiated, this may take a few minutes...',
-      timestamp: new Date().toISOString()
-    });
-    
-    scrapeProposals()
-      .then(() => {
-        console.log('✅ Manual scrape completed successfully at', new Date().toISOString());
-      })
-      .catch(err => {
-        console.error('❌ Manual scrape failed:', err);
-      });
-      
-  } catch (err) {
-    console.error('Failed to initiate scrape:', err);
-    res.status(500).json({ 
-      success: false, 
-      error: 'Failed to initiate scrape', 
-      details: err.message,
-      timestamp: new Date().toISOString()
-    });
-  }
+  res.status(202).json({
+    success: true,
+    message: 'Scrape initiated, this may take a few minutes...',
+    timestamp: new Date().toISOString()
+  });
+  
+  scrapeProposals()
+    .then(() => console.log('✅ Manual scrape completed'))
+    .catch(err => console.error('❌ Manual scrape failed:', err));
 });
 
+// Homepage with status information
 app.get('/', (req, res) => {
+  const statusColor = circuitBreakerOpen ? '#dc3545' : '#28a745';
+  const statusText = circuitBreakerOpen ? 'Database Issues Detected' : 'Service Operational';
+  
   res.send(`
     <!DOCTYPE html>
     <html>
       <head>
-        <title>Research Proposals API - Shodh Sahayak</title>
+        <title>Shodh Sahayak - Research Proposals API</title>
         <style>
           body { font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f8f9fa; }
           .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
-          h1 { margin: 0; }
-          .status { background: white; padding: 15px; border-radius: 8px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+          .status { background: white; padding: 15px; border-radius: 8px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 4px solid ${statusColor}; }
           .endpoint { background: white; padding: 15px; margin: 10px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-          .method { color: #007bff; font-weight: bold; }
-          .path { font-family: monospace; background: #e9ecef; padding: 4px 8px; border-radius: 4px; }
-          .description { color: #666; margin-top: 8px; }
+          .method { color: #007bff; font-weight: bold; padding: 2px 6px; background: #e3f2fd; border-radius: 3px; }
+          .path { font-family: monospace; background: #e9ecef; padding: 4px 8px; border-radius: 4px; margin: 0 5px; }
           .links a { color: #007bff; text-decoration: none; margin-right: 15px; }
           .links a:hover { text-decoration: underline; }
+          .status-indicator { color: ${statusColor}; font-weight: bold; }
         </style>
       </head>
       <body>
@@ -387,37 +433,40 @@ app.get('/', (req, res) => {
         </div>
         
         <div class="status">
-          <strong>🚀 Service Status:</strong> Running on Render<br>
-          <strong>🗄️ Database:</strong> PostgreSQL (Singapore)<br>
-          <strong>📊 Data:</strong> 140+ research proposals from 14 agencies<br>
-          <strong>⏰ Last Updated:</strong> ${new Date().toLocaleString()}
+          <h3>🚀 Service Status</h3>
+          <div class="status-indicator">● ${statusText}</div>
+          <div style="margin-top: 10px; font-size: 14px; color: #666;">
+            <strong>Database:</strong> PostgreSQL (Singapore)<br>
+            <strong>Pool Status:</strong> ${pool.totalCount} total, ${pool.idleCount} idle<br>
+            <strong>Last Updated:</strong> ${new Date().toLocaleString()}
+          </div>
         </div>
         
         <h2>📡 API Endpoints</h2>
         
         <div class="endpoint">
-          <span class="method">GET</span> <span class="path">/api/proposals</span>
-          <div class="description">Get all proposals (pagination: ?page=1&limit=50)</div>
+          <span class="method">GET</span><span class="path">/api/proposals</span>
+          <div style="margin-top: 8px; color: #666;">Get all research proposals (supports pagination)</div>
         </div>
         
         <div class="endpoint">
-          <span class="method">GET</span> <span class="path">/api/proposals/agency/:agency</span>
-          <div class="description">Get proposals by agency (DST, UGC, SERB, etc.)</div>
+          <span class="method">GET</span><span class="path">/api/proposals/agency/:agency</span>
+          <div style="margin-top: 8px; color: #666;">Get proposals by funding agency (DST, UGC, SERB, etc.)</div>
         </div>
         
         <div class="endpoint">
-          <span class="method">GET</span> <span class="path">/api/proposals/search?q=term</span>
-          <div class="description">Search proposals by title or agency</div>
+          <span class="method">GET</span><span class="path">/api/proposals/search</span>
+          <div style="margin-top: 8px; color: #666;">Search proposals by title or agency (?q=search_term)</div>
         </div>
         
         <div class="endpoint">
-          <span class="method">GET</span> <span class="path">/api/agencies</span>
-          <div class="description">List all funding agencies with counts</div>
+          <span class="method">GET</span><span class="path">/api/agencies</span>
+          <div style="margin-top: 8px; color: #666;">List all funding agencies with proposal counts</div>
         </div>
         
         <div class="endpoint">
-          <span class="method">GET</span> <span class="path">/health</span>
-          <div class="description">Detailed service health check</div>
+          <span class="method">GET</span><span class="path">/health</span>
+          <div style="margin-top: 8px; color: #666;">Detailed service and database health check</div>
         </div>
         
         <h3>🔗 Quick Access</h3>
@@ -430,7 +479,7 @@ app.get('/', (req, res) => {
         </div>
         
         <div style="margin-top: 30px; padding: 15px; background: #e8f5e8; border-radius: 8px; font-size: 14px;">
-          <strong>💡 For Researchers:</strong> This API aggregates funding opportunities from major Indian research agencies including DST, UGC, SERB, ICMR, DBT, BIRAC, and more. Updated regularly through automated web scraping.
+          <strong>💡 For Researchers:</strong> This API aggregates 140+ funding opportunities from major Indian research agencies. Data is updated regularly through automated scraping.
         </div>
       </body>
     </html>
@@ -440,37 +489,36 @@ app.get('/', (req, res) => {
 // Start server
 app.listen(port, () => {
   console.log(`🚀 Shodh Sahayak API running on port ${port}`);
-  console.log(`📡 Health check: https://shodhsahayak.onrender.com/health`);
-  console.log(`🔗 API endpoint: https://shodhsahayak.onrender.com/api/proposals`);
-  console.log(`🏠 Homepage: https://shodhsahayak.onrender.com/`);
+  console.log(`📡 Health: https://shodhsahayak.onrender.com/health`);
+  console.log(`🔗 API: https://shodhsahayak.onrender.com/api/proposals`);
+  console.log(`🏠 Home: https://shodhsahayak.onrender.com/`);
 });
 
-// ✅ ENHANCED: Graceful shutdown with proper cleanup
+// ✅ GRACEFUL SHUTDOWN: Proper cleanup on termination
 const gracefulShutdown = async (signal) => {
-  console.log(`🔄 ${signal} received, shutting down gracefully`);
+  console.log(`🔄 ${signal} received, shutting down gracefully...`);
   
   try {
-    console.log('🔄 Closing database pool...');
     await pool.end();
     console.log('✅ Database pool closed');
   } catch (err) {
-    console.error('❌ Error closing database pool:', err);
+    console.error('❌ Error closing pool:', err.message);
   }
   
-  console.log('👋 Shodh Sahayak API shutdown complete');
+  console.log('👋 Shodh Sahayak shutdown complete');
   process.exit(0);
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Handle uncaught exceptions to prevent crashes
+// Handle uncaught exceptions gracefully
 process.on('uncaughtException', (err) => {
-  console.error('💥 Uncaught Exception:', err);
-  // Don't exit - just log the error
+  console.error('💥 Uncaught Exception:', err.message);
+  // Don't exit - log and continue
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
-  // Don't exit - just log the error
+  console.error('💥 Unhandled Rejection:', reason);
+  // Don't exit - log and continue
 });
