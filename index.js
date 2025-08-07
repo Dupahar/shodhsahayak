@@ -10,35 +10,63 @@ const port = process.env.PORT || 3000;
 // Load environment variables
 require('dotenv').config();
 
-// Debug raw DATABASE_URL to verify env var
 console.log('▶️ Raw DATABASE_URL =', process.env.DATABASE_URL ? 'Set' : 'Not set');
 
-// ✅ FIXED: Use the same database configuration as your working scraper
+// ✅ FIXED: Improved PostgreSQL configuration for Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://proposals_velw_user:ujHJKCC0VQPxB3FjEo8cxmNqUbpoAbts@dpg-d2acjc8gjchc73egskcg-a.singapore-postgres.render.com/proposals_velw',
   ssl: {
-    rejectUnauthorized: false  // ✅ Match scraper.js SSL configuration
-  }
+    rejectUnauthorized: false
+  },
+  max: 10,                    // Maximum number of connections in pool
+  min: 0,                     // Minimum connections (important for Render)
+  idleTimeoutMillis: 30000,   // Close idle clients after 30 seconds
+  connectionTimeoutMillis: 20000, // Wait 20 seconds for connection
+  acquireTimeoutMillis: 20000,    // Wait 20 seconds to acquire connection
+  createRetryIntervalMillis: 200, // Retry interval for failed connections
+  createTimeoutMillis: 20000      // Timeout for creating connections
 });
 
-// ✅ FIXED: Ensure table exists with proper schema matching scraper.js
+// ✅ CRITICAL: Handle pool errors to prevent crashes
+pool.on('error', (err, client) => {
+  console.error('🚨 Unexpected error on idle client', err);
+  // Don't exit process, just log the error
+});
+
+// ✅ IMPROVED: Better database setup with error handling
 (async () => {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS proposals (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        agency TEXT,
-        from_date TEXT,
-        deadline TEXT,
-        link TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(title, link)
-      );
-    `);
-    console.log('✅ Table "proposals" verified/created with proper schema.');
-  } catch (err) {
-    console.error('❌ Failed to create/verify proposals table:', err);
+  let retryCount = 0;
+  const maxRetries = 3;
+  
+  while (retryCount < maxRetries) {
+    try {
+      const client = await pool.connect();
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS proposals (
+          id SERIAL PRIMARY KEY,
+          title TEXT NOT NULL,
+          agency TEXT,
+          from_date TEXT,
+          deadline TEXT,
+          link TEXT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(title, link)
+        );
+      `);
+      client.release();
+      console.log('✅ Table "proposals" verified/created with proper schema.');
+      break;
+    } catch (err) {
+      retryCount++;
+      console.error(`❌ Database setup attempt ${retryCount}/${maxRetries} failed:`, err.message);
+      
+      if (retryCount >= maxRetries) {
+        console.error('💥 Database setup failed after all retries. Service will continue but may have issues.');
+      } else {
+        console.log(`🔄 Retrying database setup in 5 seconds...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
   }
 })();
 
@@ -53,45 +81,60 @@ app.use(rateLimit({
   message: 'Too many requests, please try again later.'
 }));
 
-// ✅ IMPROVED: Better database connection middleware with detailed error info
+// ✅ IMPROVED: Resilient database connection middleware
 app.use(async (req, res, next) => {
+  let client = null;
   try {
-    const client = await pool.connect();
+    client = await pool.connect();
     client.release();
     next();
   } catch (err) {
-    console.error('Database connection error:', err);
-    res.status(500).json({ 
-      error: 'Database connection error', 
-      details: err.message,
-      timestamp: new Date().toISOString()
+    console.error('Database connection error:', err.message);
+    
+    // ✅ BETTER: Provide more helpful error response
+    res.status(503).json({ 
+      error: 'Database temporarily unavailable', 
+      details: 'Please try again in a few moments',
+      timestamp: new Date().toISOString(),
+      service: 'Research Proposals API'
     });
   }
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
+// Health check endpoint with database status
+app.get('/health', async (req, res) => {
+  let dbStatus = 'Unknown';
+  
+  try {
+    const client = await pool.connect();
+    await client.query('SELECT 1');
+    client.release();
+    dbStatus = 'Connected';
+  } catch (err) {
+    dbStatus = 'Disconnected';
+  }
+  
   res.status(200).json({ 
     status: 'UP', 
     timestamp: new Date(),
-    database: 'Connected',
-    environment: process.env.NODE_ENV || 'development'
+    database: dbStatus,
+    environment: process.env.NODE_ENV || 'production'
   });
 });
 
-// ✅ IMPROVED: Get all proposals with better error handling and pagination
+// ✅ IMPROVED: Better error handling for all API endpoints
 app.get('/api/proposals', async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const offset = (page - 1) * limit;
     
-    // Get total count
-    const countResult = await pool.query('SELECT COUNT(*) FROM proposals');
+    const countResult = await client.query('SELECT COUNT(*) FROM proposals');
     const totalCount = parseInt(countResult.rows[0].count);
     
-    // Get proposals with pagination
-    const result = await pool.query(
+    const result = await client.query(
       'SELECT * FROM proposals ORDER BY created_at DESC, deadline DESC LIMIT $1 OFFSET $2',
       [limit, offset]
     );
@@ -111,14 +154,18 @@ app.get('/api/proposals', async (req, res) => {
       error: 'Failed to retrieve proposals', 
       details: err.message 
     });
+  } finally {
+    client.release();
   }
 });
 
 // Get proposals by agency
 app.get('/api/proposals/agency/:agency', async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const { agency } = req.params;
-    const result = await pool.query(
+    const result = await client.query(
       'SELECT * FROM proposals WHERE agency ILIKE $1 ORDER BY created_at DESC, deadline DESC',
       [`%${agency}%`]
     );
@@ -135,13 +182,17 @@ app.get('/api/proposals/agency/:agency', async (req, res) => {
       error: 'Failed to retrieve proposals by agency', 
       details: err.message 
     });
+  } finally {
+    client.release();
   }
 });
 
-// ✅ NEW: Get unique agencies
+// Get unique agencies
 app.get('/api/agencies', async (req, res) => {
+  const client = await pool.connect();
+  
   try {
-    const result = await pool.query(
+    const result = await client.query(
       'SELECT agency, COUNT(*) as proposal_count FROM proposals WHERE agency IS NOT NULL GROUP BY agency ORDER BY proposal_count DESC'
     );
     res.json({ 
@@ -156,11 +207,15 @@ app.get('/api/agencies', async (req, res) => {
       error: 'Failed to retrieve agencies', 
       details: err.message 
     });
+  } finally {
+    client.release();
   }
 });
 
-// ✅ NEW: Search proposals
+// Search proposals
 app.get('/api/proposals/search', async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const { q } = req.query;
     if (!q) {
@@ -170,7 +225,7 @@ app.get('/api/proposals/search', async (req, res) => {
       });
     }
     
-    const result = await pool.query(
+    const result = await client.query(
       'SELECT * FROM proposals WHERE title ILIKE $1 OR agency ILIKE $1 ORDER BY created_at DESC',
       [`%${q}%`]
     );
@@ -188,20 +243,20 @@ app.get('/api/proposals/search', async (req, res) => {
       error: 'Failed to search proposals', 
       details: err.message 
     });
+  } finally {
+    client.release();
   }
 });
 
-// ✅ IMPROVED: Manual scrape trigger with better response
+// Manual scrape trigger
 app.post('/api/scrape', async (req, res) => {
   try {
-    // Check if scraping is already in progress (you could implement a flag)
     res.status(202).json({ 
       success: true, 
       message: 'Scrape initiated, this may take a few minutes...',
       timestamp: new Date().toISOString()
     });
     
-    // Run scraping in background
     scrapeProposals()
       .then(() => {
         console.log('✅ Manual scrape completed successfully at', new Date().toISOString());
@@ -220,7 +275,7 @@ app.post('/api/scrape', async (req, res) => {
   }
 });
 
-// ✅ IMPROVED: Enhanced homepage with better documentation
+// Homepage
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -234,11 +289,16 @@ app.get('/', (req, res) => {
           .method { color: #007bff; font-weight: bold; }
           .path { font-family: monospace; background: #e9ecef; padding: 2px 5px; border-radius: 3px; }
           .description { color: #666; margin-top: 5px; }
+          .status { background: #d4edda; border: 1px solid #c3e6cb; padding: 10px; border-radius: 5px; margin-top: 20px; }
         </style>
       </head>
       <body>
         <h1>🔬 Research Proposals API</h1>
-        <p>Indian research funding opportunities aggregator</p>
+        <div class="status">
+          <strong>Service Status:</strong> Running on Render 🚀<br>
+          <strong>Database:</strong> PostgreSQL (Singapore)<br>
+          <strong>Last Updated:</strong> ${new Date().toISOString()}
+        </div>
         
         <h2>Available Endpoints:</h2>
         
@@ -269,10 +329,10 @@ app.get('/', (req, res) => {
         
         <div class="endpoint">
           <span class="method">GET</span> <span class="path">/health</span>
-          <div class="description">API health check</div>
+          <div class="description">API health check with database status</div>
         </div>
         
-        <h3>🚀 Quick Examples:</h3>
+        <h3>🚀 Quick Test:</h3>
         <ul>
           <li><a href="/api/proposals">View all proposals</a></li>
           <li><a href="/api/proposals/agency/DST">DST proposals</a></li>
@@ -287,14 +347,30 @@ app.get('/', (req, res) => {
 // Start server
 app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
-  console.log(`📡 Health check: http://localhost:${port}/health`);
-  console.log(`🔗 API endpoint: http://localhost:${port}/api/proposals`);
-  console.log(`🏠 Homepage: http://localhost:${port}/`);
+  console.log(`📡 Health check: https://shodhsahayak.onrender.com/health`);
+  console.log(`🔗 API endpoint: https://shodhsahayak.onrender.com/api/proposals`);
+  console.log(`🏠 Homepage: https://shodhsahayak.onrender.com/`);
 });
 
-// Graceful shutdown
+// ✅ IMPROVED: Graceful shutdown with proper cleanup
 process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  await pool.end();
+  console.log('🔄 SIGTERM received, shutting down gracefully');
+  try {
+    await pool.end();
+    console.log('✅ Database pool closed');
+  } catch (err) {
+    console.error('❌ Error closing database pool:', err);
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('🔄 SIGINT received, shutting down gracefully');
+  try {
+    await pool.end();
+    console.log('✅ Database pool closed');
+  } catch (err) {
+    console.error('❌ Error closing database pool:', err);
+  }
   process.exit(0);
 });
